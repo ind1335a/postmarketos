@@ -63,11 +63,37 @@ WEBGUI=""             # none | novnc | kasmvnc  -- browser front-end for the VNC
 WEBGUI_PORT=6080
 INSTALL_SELF=1        # 1 = also install this script as /usr/bin/pmos
 AUTO_INSTALL=1        # 1 = automatically apt/dnf/pacman-install missing deps
+RECONFIGURE=0         # 1 = ignore saved config and show the menus again
+CONFIG_FILE="${PMOS_CONFIG:-$HOME/.config/pmos/config}"
 
 WORKDIR="$(mktemp -d /tmp/mobile-remote.XXXXXX)"
 LOGDIR="$WORKDIR/logs"
 mkdir -p "$LOGDIR"
 PIDS=()
+
+### ---------------- saved-config (so `pmos` can auto-start) ----------------
+# On a fresh install there's no config yet, so DE/PROTO/WEBGUI get asked
+# interactively once, then saved. Every run after that, `pmos` with no
+# arguments reuses the saved choices and starts straight away -- no menus.
+# --reconfigure forces the menus again and overwrites the saved choices.
+load_config() {
+  [[ "$RECONFIGURE" -eq 1 ]] && return 0
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+  DE="${DE:-${SAVED_DE:-}}"
+  PROTO="${PROTO:-${SAVED_PROTO:-}}"
+  WEBGUI="${WEBGUI:-${SAVED_WEBGUI:-}}"
+}
+
+save_config() {
+  mkdir -p "$(dirname "$CONFIG_FILE")" 2>/dev/null || return 0
+  cat > "$CONFIG_FILE" <<EOF
+SAVED_DE="$DE"
+SAVED_PROTO="$PROTO"
+SAVED_WEBGUI="$WEBGUI"
+EOF
+}
 
 ### ---------------- usage ----------------
 usage() {
@@ -86,14 +112,17 @@ Usage: $0 [--de phosh|plasma-mobile] [--proto vnc|rdp] [options]
   --webgui-port N       HTTP port for the browser client (default: $WEBGUI_PORT)
   --no-install-self     don't (re)install this script as /usr/bin/pmos
   --no-auto-install     don't try to apt/dnf/pacman-install missing dependencies
+  --reconfigure          show the de/proto/webgui menus again and re-save them
   -h, --help           show this help
 
 Examples:
   $0 --de phosh --proto vnc --webgui novnc
   $0 --de plasma-mobile --proto rdp --password 'changeMe123' --webgui kasmvnc
 
-After the first run, this script installs itself as /usr/bin/pmos, so you
-can just type "pmos" afterwards instead of the full path.
+After the first run, this script installs itself as /usr/bin/pmos and saves
+your de/proto/webgui choice to ~/.config/pmos/config, so afterwards just
+running "pmos" starts the same session with no prompts. Use --reconfigure
+or pass explicit flags to change it.
 EOF
   exit "${1:-0}"
 }
@@ -113,10 +142,13 @@ while [[ $# -gt 0 ]]; do
     --webgui-port) WEBGUI_PORT="$2"; shift 2 ;;
     --no-install-self) INSTALL_SELF=0; shift ;;
     --no-auto-install) AUTO_INSTALL=0; shift ;;
+    --reconfigure) RECONFIGURE=1; shift ;;
     -h|--help) usage 0 ;;
     *) echo "Unknown option: $1" >&2; usage 1 ;;
   esac
 done
+
+load_config
 
 if [[ -z "$DE" ]]; then
   echo "Select desktop shell:"
@@ -138,6 +170,8 @@ if [[ -z "$WEBGUI" ]]; then
     [[ -n "${opt:-}" ]] && WEBGUI="$opt" && break
   done
 fi
+
+save_config
 
 ### ---------------- self-install as /usr/bin/pmos ----------------
 # Copies this script to /usr/bin/pmos (via sudo) so future sessions can
@@ -369,35 +403,76 @@ mkdir -p "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
 export WAYLAND_DISPLAY="wayland-mobile"
 
+# require_alive PID NAME LOGFILE
+# Bails out with the tail of NAME's log if it already died -- surfaces
+# bad-flag / crash errors immediately instead of limping on to start a
+# VNC/RDP server against a dead compositor.
+require_alive() {
+  local pid="$1" name="$2" logfile="$3"
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "[x] $name exited immediately. Last log lines ($logfile):" >&2
+    tail -n 25 "$logfile" >&2 2>/dev/null || true
+    exit 1
+  fi
+}
+
 ### ---------------- start compositor ----------------
 start_phosh() {
   export WLR_BACKENDS=headless
   export WLR_LIBINPUT_NO_DEVICES=1
 
   phoc -C /etc/phosh/phoc.ini >"$LOGDIR/phoc.log" 2>&1 &
-  PIDS+=($!)
+  local phoc_pid=$!
+  PIDS+=("$phoc_pid")
   sleep 2
+  require_alive "$phoc_pid" "phoc" "$LOGDIR/phoc.log"
 
   if command -v wlr-randr &>/dev/null; then
     wlr-randr --output HEADLESS-1 --custom-mode "${WIDTH}x${HEIGHT}" 2>/dev/null || true
   fi
 
   phosh >"$LOGDIR/phosh.log" 2>&1 &
-  PIDS+=($!)
+  local phosh_pid=$!
+  PIDS+=("$phosh_pid")
   sleep 2
+  require_alive "$phosh_pid" "phosh" "$LOGDIR/phosh.log"
+}
+
+# Different kwin_wayland versions select the headless backend differently:
+# newer builds take `--backend virtual`, older ones take a bare `--virtual`
+# flag instead (and some don't support --width/--height at all). Rather
+# than hardcode one, ask the binary itself via --help.
+build_kwin_backend_args() {
+  local help_out
+  help_out="$(kwin_wayland --help 2>&1 || true)"
+  KWIN_BACKEND_ARGS=()
+
+  if echo "$help_out" | grep -qE -- '--backend\b'; then
+    KWIN_BACKEND_ARGS+=(--backend virtual)
+  elif echo "$help_out" | grep -qE -- '--virtual\b'; then
+    KWIN_BACKEND_ARGS+=(--virtual)
+  else
+    echo "[!] Neither --backend nor --virtual found in 'kwin_wayland --help' on" >&2
+    echo "    this system -- trying --virtual anyway. Run 'kwin_wayland --help'" >&2
+    echo "    yourself and adjust build_kwin_backend_args() if this fails." >&2
+    KWIN_BACKEND_ARGS+=(--virtual)
+  fi
+
+  echo "$help_out" | grep -qE -- '--width\b'  && KWIN_BACKEND_ARGS+=(--width "$WIDTH")
+  echo "$help_out" | grep -qE -- '--height\b' && KWIN_BACKEND_ARGS+=(--height "$HEIGHT")
 }
 
 start_plasma_mobile() {
-  # Best-effort invocation -- verify flags against `kwin_wayland --help`
-  # on your system and the Exec= line in
-  # /usr/share/wayland-sessions/plasma-mobile.desktop if this fails.
+  build_kwin_backend_args
+  echo "[i] kwin_wayland ${KWIN_BACKEND_ARGS[*]} --exit-with-session=$PLASMA_MOBILE_CMD"
   kwin_wayland \
-    --backend virtual \
-    --width "$WIDTH" --height "$HEIGHT" \
+    "${KWIN_BACKEND_ARGS[@]}" \
     --exit-with-session="$PLASMA_MOBILE_CMD" \
     >"$LOGDIR/kwin.log" 2>&1 &
-  PIDS+=($!)
+  local kwin_pid=$!
+  PIDS+=("$kwin_pid")
   sleep 3
+  require_alive "$kwin_pid" "kwin_wayland" "$LOGDIR/kwin.log"
 }
 
 case "$DE" in
@@ -419,7 +494,10 @@ start_vnc() {
   } > "$cfg"
 
   wayvnc -C "$cfg" >"$LOGDIR/wayvnc.log" 2>&1 &
-  PIDS+=($!)
+  local wayvnc_pid=$!
+  PIDS+=("$wayvnc_pid")
+  sleep 1
+  require_alive "$wayvnc_pid" "wayvnc" "$LOGDIR/wayvnc.log"
   echo "[i] VNC listening on $BIND_ADDR:$VNC_PORT"
 }
 
@@ -435,8 +513,10 @@ start_rdp_via_vnc_bridge() {
   } > "$cfg"
 
   wayvnc -C "$cfg" >"$LOGDIR/wayvnc.log" 2>&1 &
-  PIDS+=($!)
+  local wayvnc_pid=$!
+  PIDS+=("$wayvnc_pid")
   sleep 1
+  require_alive "$wayvnc_pid" "wayvnc" "$LOGDIR/wayvnc.log"
 
   local xrdp_ini="$WORKDIR/xrdp.ini"
   cp /etc/xrdp/xrdp.ini "$xrdp_ini" 2>/dev/null || echo "[Globals]" > "$xrdp_ini"
@@ -465,7 +545,10 @@ EOF
   echo "    'mobile-bridge' session at the xrdp login screen."
 
   xrdp --config "$xrdp_ini" --nodaemon >"$LOGDIR/xrdp.log" 2>&1 &
-  PIDS+=($!)
+  local xrdp_pid=$!
+  PIDS+=("$xrdp_pid")
+  sleep 1
+  require_alive "$xrdp_pid" "xrdp" "$LOGDIR/xrdp.log"
   echo "[i] RDP listening on 0.0.0.0:$RDP_PORT (bridged to local VNC)"
 }
 

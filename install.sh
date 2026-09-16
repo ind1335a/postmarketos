@@ -369,8 +369,8 @@ check_deps() {
 
   case "$DE" in
     phosh)
-      ensure_installed phoc   phoc phoc phoc   || missing+=("phoc")
-      ensure_installed phosh  phosh phosh phosh || missing+=("phosh")
+      ensure_installed phoc      phoc phoc phoc   || missing+=("phoc")
+      ensure_installed phosh-session phosh phosh phosh || missing+=("phosh-session")
       ;;
     plasma-mobile)
       ensure_installed kwin_wayland kwin-wayland kwin plasma-mobile || missing+=("kwin_wayland")

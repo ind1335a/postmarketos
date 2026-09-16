@@ -416,6 +416,43 @@ require_alive() {
   fi
 }
 
+# detect_actual_wayland_socket TIMEOUT PID NAME LOGFILE
+# Different kwin_wayland/phoc builds don't all honour the WAYLAND_DISPLAY
+# env var (or an explicit --socket flag) the same way for naming the
+# socket they create -- rather than assume our requested name ("wayland-
+# mobile") was actually used, poll $XDG_RUNTIME_DIR for whatever socket
+# appears and adopt its real name. This is what fixed the previous
+# "Failed to connect to WAYLAND_DISPLAY=wayland-mobile" error: kwin had
+# created a socket under a different name than the one we assumed.
+detect_actual_wayland_socket() {
+  local timeout="$1" pid="$2" name="$3" logfile="$4"
+  local waited=0 f found=""
+  while (( waited < timeout * 2 )); do
+    for f in "$XDG_RUNTIME_DIR"/wayland-*; do
+      [[ -S "$f" ]] || continue
+      found="$f"
+      break
+    done
+    if [[ -n "$found" ]]; then
+      WAYLAND_DISPLAY="$(basename "$found")"
+      export WAYLAND_DISPLAY
+      echo "[i] $name is listening on Wayland socket: $WAYLAND_DISPLAY"
+      return 0
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "[x] $name exited before creating a Wayland socket. Last log lines ($logfile):" >&2
+      tail -n 25 "$logfile" >&2 2>/dev/null || true
+      exit 1
+    fi
+    sleep 0.5
+    waited=$((waited + 1))
+  done
+  echo "[x] $name is still running but never created a Wayland socket in" >&2
+  echo "    $XDG_RUNTIME_DIR within ${timeout}s. Last log lines ($logfile):" >&2
+  tail -n 25 "$logfile" >&2 2>/dev/null || true
+  exit 1
+}
+
 ### ---------------- start compositor ----------------
 start_phosh() {
   export WLR_BACKENDS=headless
@@ -424,8 +461,7 @@ start_phosh() {
   phoc -C /etc/phosh/phoc.ini >"$LOGDIR/phoc.log" 2>&1 &
   local phoc_pid=$!
   PIDS+=("$phoc_pid")
-  sleep 2
-  require_alive "$phoc_pid" "phoc" "$LOGDIR/phoc.log"
+  detect_actual_wayland_socket 15 "$phoc_pid" "phoc" "$LOGDIR/phoc.log"
 
   if command -v wlr-randr &>/dev/null; then
     wlr-randr --output HEADLESS-1 --custom-mode "${WIDTH}x${HEIGHT}" 2>/dev/null || true
@@ -460,6 +496,8 @@ build_kwin_backend_args() {
 
   echo "$help_out" | grep -qE -- '--width\b'  && KWIN_BACKEND_ARGS+=(--width "$WIDTH")
   echo "$help_out" | grep -qE -- '--height\b' && KWIN_BACKEND_ARGS+=(--height "$HEIGHT")
+  # best-effort hint; detect_actual_wayland_socket is the real safety net
+  echo "$help_out" | grep -qE -- '--socket\b'  && KWIN_BACKEND_ARGS+=(--socket "$WAYLAND_DISPLAY")
 }
 
 start_plasma_mobile() {
@@ -471,8 +509,7 @@ start_plasma_mobile() {
     >"$LOGDIR/kwin.log" 2>&1 &
   local kwin_pid=$!
   PIDS+=("$kwin_pid")
-  sleep 3
-  require_alive "$kwin_pid" "kwin_wayland" "$LOGDIR/kwin.log"
+  detect_actual_wayland_socket 20 "$kwin_pid" "kwin_wayland" "$LOGDIR/kwin.log"
 }
 
 case "$DE" in
